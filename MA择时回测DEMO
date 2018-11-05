@@ -1,0 +1,255 @@
+import pandas as pd
+import numpy as np
+import copy
+import matplotlib.pyplot as plt 
+from abc import ABCMeta, abstractmethod
+import tushare as ts 
+import datetime
+import talib
+%matplotlib inline 
+
+#生成的订单数据，包含买卖时间，买卖价格，买卖因子类型。
+class Orders():
+    __slots__ = ['buy_price', 'buy_date', 'sell_price', 'sell_date', 'order_deal', 'order_sell',
+                 'buy_factor', 'buy_factor_class', 'sell_type_extra']
+    def __init__(self):
+        self.order_deal = False
+        
+    def fit_buy_order(self, today, factor_buy_class):
+        self.buy_price = factor_buy_class.stock_data.loc[today].close
+        self.buy_factor = factor_buy_class.factor_name
+        self.buy_factor_class = factor_buy_class.__class__.__name__
+        self.buy_date = today
+        self.sell_price = None
+        self.sell_date = None
+        self.sell_type_extra = ''
+        self.order_deal = True
+        self.order_sell = False
+        
+    def fit_sell_order(self, today, factor_sell_class):
+        self.sell_price = factor_sell_class.stock_data.loc[today].close
+        self.sell_date = today
+        self.sell_type_extra = factor_sell_class.factor_name
+        self.order_sell = True
+        
+        
+ #买入因子实现基类
+class Factor_buy_base(object):
+    def __init__(self, stock_data, **kwargs):
+        self.stock_data = stock_data
+        
+    def stock_position(self):
+        pass
+    
+    def stock_slippage(self, **kwargs):
+        pass
+    
+    def buy_order(self,today):
+        order = Orders()
+        order.fit_buy_order(today,self)
+        return order
+    
+
+#双均线策略买入因子实现    
+class Factor_buy_ma(Factor_buy_base):
+    
+    def __init__(self, stock_data, **kwargs):
+        super().__init__(stock_data, **kwargs)
+        self.slow = kwargs['slow']
+        self.factor_name = '{}:{}'.format(self.__class__.__name__, self.slow)
+        
+    def fit_day(self,today):
+        fast = 5
+        self.today = pd.to_datetime(today)
+        fast_ma = self.stock_data['close'].rolling(window = fast,center = False).sum()/fast
+        slow_ma = self.stock_data['close'].rolling(window = self.slow,center = False).sum()/self.slow 
+        self.stock_data['fast_ma'] = fast_ma
+        self.stock_data['slow_ma'] = slow_ma
+        self.stock_data['singal'] = np.where(stock_data['fast_ma'] > stock_data['slow_ma'],1,0)
+        if self.stock_data.loc[self.today].singal == 1 and \
+            self.stock_data.shift(1).loc[self.today].singal == 0:
+            return self.buy_order(self.today)
+        return None
+        
+        
+ #卖出因子实现基类
+class Factor_sell_base(metaclass=ABCMeta):
+    
+    def __init__(self, stock_data, **kwargs):
+        self.stock_data = stock_data
+        
+    @abstractmethod    
+    def fit_day(self, *args, **kwargs):
+        pass
+    
+    def sell_tomorrow(self,order,today):
+        order.fit_sell_order(today, self)
+        return order
+    
+    
+#双均线卖出因子实现类，继承Factor_sell_base基类       
+class Factor_sell_ma(Factor_sell_base):
+    
+    def __init__(self, stock_data, **kwargs):
+        self.slow = kwargs['slow']
+        super().__init__(stock_data, **kwargs)
+        self.factor_name = '{}:{}'.format(self.__class__.__name__, self.slow)
+        
+    def fit_day(self,today,orders):
+        fast = 5
+        self.today = pd.to_datetime(today)
+        fast_ma = self.stock_data['close'].rolling(window=fast, center=False).sum()/fast
+        slow_ma = self.stock_data['close'].rolling(window=self.slow, center=False).sum()/self.slow 
+        self.stock_data['fast_ma'] = fast_ma
+        self.stock_data['slow_ma'] = slow_ma
+        self.stock_data['singal'] = np.where(self.stock_data['fast_ma'] > self.stock_data['slow_ma'],1,0)
+        if self.stock_data.loc[self.today].singal == 0 and \
+            self.stock_data.shift(1).loc[self.today].singal == 1:
+            for order in orders:
+                if not order.order_sell:   #增加条件：如果单子已卖出，不再处理
+                    self.sell_tomorrow(order,self.today)  
+                    
+                    
+ #择时基类，抽象接口
+class Stock_picktime_base(metaclass=ABCMeta):
+    @abstractmethod
+    def init_buy_factors(self, *args, **kwargs):
+        pass
+    
+    @abstractmethod
+    def init_sell_factors(self, *args, **kwargs):
+        pass
+        
+        
+#择时基类，包括初始化买卖因子及买卖订单的实现
+class Stock_pick_time(Stock_picktime_base):
+    def __init__(self, stock_data, buy_factors, sell_factors):
+        self.stock_data = stock_data
+        self.init_buy_factors(buy_factors)
+        self.init_sell_factors(sell_factors)
+        self.orders = list()
+    
+    def __str__(self):
+        return 'buy_factors:{}\nsell_factors:{}'.format(self.buy_factors, self.sell_factors)
+    
+    def init_buy_factors(self, buy_factors):
+        self.buy_factors = list()
+        for factor_class in buy_factors:
+            if 'class' not in factor_class:
+                raise ValueError('factor class key must name class!')
+            factor_class = copy.deepcopy(factor_class)
+            class_fac = factor_class.pop('class')
+            factor = class_fac(self.stock_data, **factor_class)
+            if not isinstance(factor, Factor_buy_base):
+                raise TypeError('factor must base Factor_buy_base!')
+            self.buy_factors.append(factor)
+            
+    def init_sell_factors(self, sell_factors):
+        self.sell_factors = list()
+        for factor_class in sell_factors:
+            if factor_class is None:
+                continue
+            if 'class' not in factor_class:
+                raise ValueError('factor class must name class!')
+            factor_class = copy.deepcopy(factor_class)
+            class_fac = factor_class.pop('class')
+            factor = class_fac(self.stock_data, **factor_class)
+            if not isinstance(factor, Factor_sell_base):
+                raise TypeError('factor must base Factor_sell_base!')
+            self.sell_factors.append(factor)
+            
+    #通过fit方法调用day_task，还可添加周任务，月任务           
+    def day_task(self,today):
+        self.today = today
+        for buy_factor in self.buy_factors:
+            order = buy_factor.fit_day(self.today)
+            if order and order.order_deal:
+                self.orders.append(order)
+                
+        for sell_factor in self.sell_factors:
+            sell_factor.fit_day(self.today,self.orders)
+    
+    def fit(self, *args, **kwargs):
+        data = self.stock_data.trade_date
+        data.apply(self.day_task)
+        
+        
+#将成交的买卖订单转换为DF
+def make_orders_pd(orders):
+    orders_pd = None
+    for index_, order in enumerate(orders):
+        order_pd = pd.DataFrame(np.array([order.buy_date, order.buy_price,
+                                          order.sell_date, order.sell_price]).reshape(1,-1),
+                                          index=[index_], columns=['buy_date', 'buy_price',
+                                                                  'sell_date', 'sell_price'])
+        orders_pd = order_pd if orders_pd is None else pd.concat([orders_pd, order_pd])
+        orders_pd['buy_price'] = orders_pd.buy_price.astype(float)
+        orders_pd['sell_price'] = orders_pd.sell_price.astype(float)
+        orders_pd['buy_date'] = pd.to_datetime(orders_pd['buy_date'],format='%Y-%m-%d')
+        orders_pd['sell_date'] = pd.to_datetime(orders_pd['sell_date'],format='%Y-%m-%d')
+        orders_pd['profit'] = (orders_pd['sell_price']/orders_pd['buy_price'] - 1)*100
+    return orders_pd
+    
+#将生成的数据用图形显示出来   
+def draw(orders, stock_data, benchmark):
+    orders_pd = make_orders_pd(orders)
+    orders_pd = orders_pd.dropna()#将最后未完成卖出的单子去除
+    orders_pd['win_loss'] = np.where(orders_pd.profit > 0, 1, 0)
+    win_loss = orders_pd.win_loss.value_counts()
+    win_loss_ratio = round(win_loss[1] / win_loss[0], 2)
+    win = round(win_loss[1] * 100 / (win_loss[1] + win_loss[0]), 2)
+    benchmark_profit = round(benchmark['pct_change'].sum(), 2)
+    orders_pd_profit = round(orders_pd['profit'].sum(), 2)
+    benchmark_y_profit = round(benchmark_profit * 250 / (benchmark.index[-1] - 
+                                                         benchmark.index[0]).days, 2)
+    orders_y_profit = round(orders_pd_profit * 250 / (orders_pd.iloc[-1].sell_date - 
+                                                      orders_pd.loc[0].buy_date).days, 2)
+    print('胜率:{}%'.format(win))
+    print('基准收益:{}%'.format(benchmark_profit))
+    print('策略收益:{}%'.format(orders_pd_profit))
+    print('基准年化收益:{}%'.format(benchmark_y_profit))
+    print('策略年化收益:{}%'.format(orders_y_profit))
+    
+    _,axs = plt.subplots(nrows=2, ncols=1, figsize=(12,8))
+    drawer = axs[0]
+    drawer.plot(stock_data.close, color='blue')
+    stock_data['key'] = np.arange(stock_data.shape[0])
+    start = []
+    end = []
+    for _,date in enumerate(orders_pd.buy_date):
+        start.append(stock_data[stock_data.index==date].key.values[0])
+    for _,date in enumerate(orders_pd.sell_date):
+        end.append(stock_data[stock_data.index==date].key.values[0])
+    for start,end in zip(start, end):
+        drawer.fill_between(stock_data.index[start:end], 0, 
+                            stock_data.close[start:end], color = 'g' ,alpha =0.28) 
+        
+    drawer1 = axs[1]
+    orders_pd.index = orders_pd.sell_date
+    drawer1.plot(orders_pd['profit'].cumsum(), color='red', label='ma_profit')
+    drawer1.plot(benchmark['pct_change'].cumsum(), color='blue', label='benchmark')
+    drawer1.plot(stock_data['pct_change'].cumsum(), color='g', label='stock_data_profit')
+    drawer1.axhline(0, color='m')
+    drawer1.legend()
+    
+   
+#获取个股数据    
+def get_stock_data(code, startdate, enddate): 
+    api = ts.pro_api('34779942b3c36854483d01d70d7d2e9862e6c947dd06bbb27c7ab9a2')
+    stock_data = ts.pro_bar(pro_api= api, ts_code=code, start_date=startdate, end_date=enddate)
+    stock_data.index = pd.to_datetime(stock_data.trade_date)
+    stock_data = stock_data.sort_index(axis=0)
+    stock_data['atr14'] = talib.ATR(stock_data.high.values, stock_data.low.values,
+                                    stock_data.close.values, timeperiod=14)
+    stock_data['atr21'] = talib.ATR(stock_data.high.values, stock_data.low.values,
+                                    stock_data.close.values, timeperiod=21)
+    stock_data.index.name = 'Date'
+    return stock_data
+    
+#获取指数行情数据
+def get_benchmark(code, startdate, enddate):
+    api = ts.pro_api('34779942b3c36854483d01d70d7d2e9862e6c947dd06bbb27c7ab9a2')
+    benchmark = ts.pro_bar(pro_api= api, ts_code=code, asset='I', start_date=startdate, end_date=enddate)
+    benchmark.index = pd.to_datetime(benchmark.trade_date,format='%Y-%m-%d')
+    benchmark = benchmark.sort_index(axis=0)
+    return benchmark

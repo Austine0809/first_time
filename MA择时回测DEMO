@@ -8,7 +8,7 @@ import datetime
 import talib
 %matplotlib inline 
 
-#生成的订单数据，包含买卖时间，买卖价格，买卖因子类型。
+#生成的订单数据，包含买卖时间，买卖价格，买卖因子类型
 class Orders():
     __slots__ = ['buy_price', 'buy_date', 'sell_price', 'sell_date', 'order_deal', 'order_sell',
                  'buy_factor', 'buy_factor_class', 'sell_type_extra']
@@ -121,7 +121,7 @@ class Stock_picktime_base(metaclass=ABCMeta):
         pass
         
         
-#择时基类，包括初始化买卖因子及买卖订单的实现
+#股票择时类，包括初始化买卖因子及买卖订单的实现，继承stock_picktime_base基类
 class Stock_pick_time(Stock_picktime_base):
     def __init__(self, stock_data, buy_factors, sell_factors):
         self.stock_data = stock_data
